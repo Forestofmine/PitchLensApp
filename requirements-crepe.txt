@@ -1,0 +1,7 @@
+# Optional CREPE backend.
+#
+# ONNX Runtime currently publishes wheels for Python <= 3.14.  On Python 3.15
+# the app automatically uses the built-in YIN detector.  If you run a Python
+# version with an onnxruntime wheel, install it and place a CREPE ONNX model at
+# a local path, then select CREPE in Settings.
+onnxruntime>=1.17; python_version < "3.15"

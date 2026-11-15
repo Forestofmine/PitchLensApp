@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+artifacts/
+installer/
+.pytest_cache/
+*.log
+settings.json
+docs/*.pitchproj
+docs/开发笔记.md
+tests/smoke_*.png
+tests/fixtures/jianpu/*
+!tests/fixtures/jianpu/README.md
+!tests/fixtures/jianpu/demo_jianpu.png
+!tests/fixtures/jianpu/demo_jianpu.expected.txt
