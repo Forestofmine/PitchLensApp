@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from collections import deque
+from bisect import bisect_left, bisect_right
+from operator import attrgetter
 
 import numpy as np
 import pyqtgraph as pg
@@ -84,7 +85,8 @@ class PitchTimeline(QWidget):
     def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
-        self._frames: deque[PitchFrame] = deque(maxlen=2400)
+        self._frames: list[PitchFrame] = []
+        self._last_voiced_frame: PitchFrame | None = None
         self._y_range = (55.0, 79.0)
         self._last_state = FollowState()
         self._last_now = 0.0
@@ -324,14 +326,20 @@ class PitchTimeline(QWidget):
 
     # ----------------------------------------------------------------- data
     def append_frames(self, frames: list[PitchFrame]) -> None:
-        for frame in frames:
-            self._frames.append(frame)
-        if len(self._frames) > 2400:
-            while len(self._frames) > 2400:
-                self._frames.popleft()
+        self._frames.extend(frames)
+        for frame in reversed(frames):
+            if frame.voiced and frame.midi_float is not None and math.isfinite(frame.midi_float):
+                self._last_voiced_frame = frame
+                break
+
+    def end_segment(self) -> None:
+        if self._frames and self._frames[-1].voiced:
+            self._frames.append(PitchFrame(audio_time=self._frames[-1].audio_time))
 
     def clear(self) -> None:
         self._frames.clear()
+        self._last_voiced_frame = None
+        self.plot.getViewBox().setLimits(xMin=-60)
         self.curve.setData([], [])
         self.curve_glow.setData([], [])
         self.raw_curve.setData([], [])
@@ -352,6 +360,8 @@ class PitchTimeline(QWidget):
         self.plot.setMouseEnabled(paused, False)
         self.review_btn.setVisible(paused)
         if paused:
+            earliest = self._frames[0].audio_time - self._last_now if self._frames else 0.0
+            self.plot.getViewBox().setLimits(xMin=min(-60.0, earliest - 0.5))
             self.plot.setCursor(Qt.CursorShape.OpenHandCursor)
             self.legend_label.setText("回看模式 · 左右拖动查看历史 · 点击“回到当前”复位")
             if self._last_follower is not None:
@@ -406,15 +416,12 @@ class PitchTimeline(QWidget):
         right = future
         if self._paused:
             view_left, view_right = self.plot.getViewBox().viewRange()[0]
-            data_left, data_right = -120.0, max(60.0, future)
-            label_left, label_right = float(view_left), float(view_right)
+            left, right = float(view_left), float(view_right)
             self.history_rect.setRect(
                 QRectF(view_left, 24, max(0.0, -view_left), 84)
             )
             self.future_rect.setRect(QRectF(0, 24, max(0.0, view_right), 84))
         else:
-            data_left, data_right = left, right
-            label_left, label_right = left, right
             if self.plot.getViewBox().viewRange()[0][0] != left:
                 self.plot.setXRange(left, right, padding=0)
             self.history_rect.setRect(QRectF(left, 24, -left, 84))
@@ -424,18 +431,17 @@ class PitchTimeline(QWidget):
         ys: list[float] = []
         raw_xs: list[float] = []
         raw_ys: list[float] = []
-        last_voiced: PitchFrame | None = None
-        for frame in self._frames:
+        frame_time = attrgetter("audio_time")
+        first = bisect_left(self._frames, now + left - 0.5, key=frame_time)
+        last = bisect_right(self._frames, now + right + 0.5, key=frame_time)
+        for frame in self._frames[first:last]:
             x = frame.audio_time - now
-            if not self._paused and (x < left - 0.5 or x > right + 0.5):
-                continue
             if frame.voiced and frame.midi_float is not None and math.isfinite(frame.midi_float):
                 xs.append(x)
                 ys.append(float(frame.midi_float))
                 if frame.raw_midi_float is not None:
                     raw_xs.append(x)
                     raw_ys.append(float(frame.raw_midi_float))
-                last_voiced = frame
             else:
                 # A NaN breaks the line instead of connecting across silence.
                 xs.append(x)
@@ -455,20 +461,13 @@ class PitchTimeline(QWidget):
 
         current_midi = None
         current_hz = None
+        last_voiced = self._last_voiced_frame
         if last_voiced is not None and (now - last_voiced.audio_time) <= 0.35:
             current_midi = last_voiced.midi_float
             current_hz = last_voiced.frequency_hz
 
-        self._update_pitch_band(current_midi, label_left, label_right)
-
-        self._draw_targets(
-            state,
-            data_left,
-            data_right,
-            follower,
-            label_left=label_left,
-            label_right=label_right,
-        )
+        self._update_pitch_band(current_midi, left, right)
+        self._draw_targets(state, left, right, follower)
         target_midi = state.target_midi if state.target is not None else None
         target_state = "none"
         error = state.error_cents
@@ -511,7 +510,7 @@ class PitchTimeline(QWidget):
             self.deviation_line.setData([], [])
             self.target_line.setVisible(False)
 
-        self._update_y_range(current_midi, state, follower)
+        self._update_y_range(current_midi, state, follower, ys if self._paused else [])
         self._update_hud(current_midi, current_hz, error, state, target_state)
         if not self._paused:
             if state.status == "lost":
@@ -567,9 +566,6 @@ class PitchTimeline(QWidget):
         left: float,
         right: float,
         follower: ScoreFollower | None,
-        *,
-        label_left: float | None = None,
-        label_right: float | None = None,
     ) -> None:
         past = QPainterPath()
         future = QPainterPath()
@@ -585,8 +581,8 @@ class PitchTimeline(QWidget):
             return
         notes = (
             follower.timed_notes(
-                horizon_past=120.0 if self._paused else self.settings.history_seconds,
-                horizon_future=60.0 if self._paused else self.settings.future_seconds,
+                horizon_past=-left,
+                horizon_future=right,
             )
             if follower is not None
             else []
@@ -615,12 +611,7 @@ class PitchTimeline(QWidget):
         self.past_band_item.setPath(past)
         self.future_band_item.setPath(future)
         self.current_band_item.setPath(current)
-        self._place_target_labels(
-            notes,
-            state,
-            label_left if label_left is not None else left,
-            label_right if label_right is not None else right,
-        )
+        self._place_target_labels(notes, state, left, right)
 
     def _style_future_bands(self, lost: bool) -> None:
         color = QColor(COLORS["target_future_lost"] if lost else COLORS["target_future"])
@@ -696,6 +687,7 @@ class PitchTimeline(QWidget):
         current_midi: float | None,
         state: FollowState,
         follower: ScoreFollower | None,
+        review_pitches: list[float],
     ) -> None:
         values: list[float] = []
         if current_midi is not None:
@@ -706,10 +698,7 @@ class PitchTimeline(QWidget):
             for note, _, _ in follower.timed_notes(horizon_past=2.0, horizon_future=4.0):
                 if note.midi_pitch is not None:
                     values.append(float(note.midi_pitch))
-        if self._paused:
-            for frame in self._frames:
-                if frame.voiced and frame.midi_float is not None:
-                    values.append(float(frame.midi_float))
+        values.extend(pitch for pitch in review_pitches if math.isfinite(pitch))
         if not values:
             return
         low = min(values) - 4.0

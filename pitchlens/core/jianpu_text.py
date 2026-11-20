@@ -12,7 +12,7 @@ Example::
 Modifiers:
     1'       one octave up       1,   one octave down
     1_       eighth note         1__  sixteenth note
-    1.       dotted note         1-   extends the previous note by one beat
+    1.       dotted note         -    extends the previous note in this measure
     0        rest                #4 / b7  chromatic alteration
 """
 
@@ -89,34 +89,23 @@ def parse_jianpu_text(text: str, *, title: str = "手动录入乐谱") -> Parsed
     notes: list[NoteEvent] = []
     warnings: list[str] = []
     measure = 0
-    measure_has_content = False
-    beat_in_measure = 0.0
     prev_note: NoteEvent | None = None
-    pending_measure_break = False
-    expected_measure_beats = meter_num * (4.0 / meter_den)
-
-    def finish_measure() -> None:
-        nonlocal measure, measure_has_content, beat_in_measure, pending_measure_break
-        if not measure_has_content:
-            return
-        if abs(beat_in_measure - expected_measure_beats) > 1e-6:
-            warnings.append(
-                f"第 {measure + 1} 小节为 {beat_in_measure:g} 拍，拍号要求 {expected_measure_beats:g} 拍"
-            )
-        measure += 1
-        measure_has_content = False
-        beat_in_measure = 0.0
-        pending_measure_break = False
 
     for raw in tokens:
-        if raw == "|":
-            finish_measure()
+        if raw in {"|", "||", "|."}:
+            if prev_note is not None and prev_note.measure_index == measure:
+                measure += 1
             continue
-        if raw in {"||", "|.", ":"}:
+        if raw == ":":
             continue
         if raw == "-":
-            if prev_note is None or prev_note.is_rest:
-                # A leading dash is a one-beat rest.
+            crosses_bar = prev_note is not None and prev_note.measure_index != measure
+            if crosses_bar:
+                warnings.append(
+                    f"第 {measure + 1} 小节开头的延长线不支持跨小节，已按一拍休止处理"
+                )
+            if prev_note is None or crosses_bar or prev_note.is_rest:
+                # A dash without a preceding sung note in this measure is a rest.
                 note = NoteEvent(
                     id=len(notes),
                     degree=0,
@@ -128,8 +117,6 @@ def parse_jianpu_text(text: str, *, title: str = "手动录入乐谱") -> Parsed
                 prev_note = note
             else:
                 prev_note.duration_beat += 1.0
-            beat_in_measure += 1.0
-            measure_has_content = True
             continue
         match = TOKEN_RE.fullmatch(raw)
         if not match:
@@ -158,11 +145,6 @@ def parse_jianpu_text(text: str, *, title: str = "手动录入乐谱") -> Parsed
         )
         notes.append(note)
         prev_note = note
-        beat_in_measure += duration
-        measure_has_content = True
-
-    if measure_has_content:
-        finish_measure()
 
     score = Score(
         title=title,
@@ -174,12 +156,9 @@ def parse_jianpu_text(text: str, *, title: str = "手动录入乐谱") -> Parsed
         mode="major",
         notes=notes,
         source="text",
+        source_warnings=list(dict.fromkeys(warnings)),
     )
     score.refresh()
-    warnings.extend(score.warnings)
-    # De-duplicate while preserving order.
-    seen: set[str] = set()
-    score.warnings = [w for w in warnings if not (w in seen or seen.add(w))]
     return ParsedJianpu(score=score, header=header, warnings=list(score.warnings))
 
 

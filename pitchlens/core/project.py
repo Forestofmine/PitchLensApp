@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import os
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,17 +69,31 @@ class ProjectIO:
     def save(project: Project, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = project.to_dict(embed_image=False)
-        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "project.json",
-                json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
-            )
-            if project.image_bytes:
-                ext = project.image_ext or ".png"
-                if not ext.startswith("."):
-                    ext = "." + ext
-                archive.writestr(f"score{ext}", project.image_bytes)
+        metadata = json.dumps(project.to_dict(), ensure_ascii=False, indent=2).encode("utf-8")
+        pending_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=".pitchlens-", suffix=".tmp", delete=False
+            ) as pending:
+                pending_path = Path(pending.name)
+                with zipfile.ZipFile(pending, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr("project.json", metadata)
+                    if project.image_bytes:
+                        ext = project.image_ext or ".png"
+                        if not ext.startswith("."):
+                            ext = "." + ext
+                        archive.writestr(f"score{ext}", project.image_bytes)
+                pending.flush()
+                os.fsync(pending.fileno())
+            # Windows requires the temporary file handle to be closed first.
+            os.replace(pending_path, path)
+            pending_path = None
+        finally:
+            if pending_path is not None:
+                try:
+                    pending_path.unlink(missing_ok=True)
+                except OSError:
+                    logging.warning("Could not remove temporary project %s", pending_path, exc_info=True)
 
     @staticmethod
     def load(path: str | Path) -> Project:

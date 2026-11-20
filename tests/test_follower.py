@@ -13,15 +13,15 @@ def _sing(score, factors=None, dt=0.02):
         duration = note.duration_beat * 60 / 90 * factors[index % len(factors)]
         steps = max(1, int(duration / dt))
         for step in range(steps):
-            midi = float(note.midi_pitch) if note.midi_pitch is not None else 60.0
+            midi = float(note.midi_pitch) if note.midi_pitch is not None else None
             frame = PitchFrame(
                 audio_time=time,
                 frequency_hz=440.0,
                 midi_float=midi,
                 raw_midi_float=midi,
                 confidence=0.95,
-                voiced=True,
-                onset_strength=0.9 if step == 0 else 0.03,
+                voiced=midi is not None,
+                onset_strength=0.9 if midi is not None and step == 0 else 0.03,
             )
             follower.update(frame, time)
             time += dt
@@ -92,6 +92,49 @@ class FollowerTests(unittest.TestCase):
         self.assertTrue(notes)
         self.assertAlmostEqual(notes[0][1], 0.0, places=4)
         self.assertAlmostEqual(notes[1][1], 60 / 90, places=4)
+
+    def test_first_rest_advances_without_voice_for_auto_start_and_seek(self):
+        score = parse_jianpu_text("1=C 4/4 60\n| 0 1 2 3 |").score
+        for entry in ("auto", "seek", "reset"):
+            with self.subTest(entry=entry):
+                follower = ScoreFollower(score, bpm_hint=60)
+                if entry == "seek":
+                    follower.seek(0, 10.0)
+                elif entry == "reset":
+                    follower.reset(0, now=10.0)
+                follower.update(PitchFrame(audio_time=10.0))
+                state = follower.update(PitchFrame(audio_time=10.5))
+                self.assertEqual(state.note_index, 0)
+                self.assertAlmostEqual(state.beat_position, 0.5)
+                state = follower.update(PitchFrame(audio_time=11.0))
+                self.assertEqual(state.note_index, 1)
+                self.assertEqual(state.status, "tracking")
+
+    def test_consecutive_rests_advance_without_losing_track(self):
+        score = parse_jianpu_text("1=C 6/4 60\n| 1 0 0 0 0 2 |").score
+        follower = ScoreFollower(score, bpm_hint=60, start_index=0)
+        for step in range(50):
+            follower.update(PitchFrame(audio_time=step * 0.02, midi_float=60.0, confidence=0.95, voiced=True))
+        for step in range(50, 250):
+            time = step * 0.02
+            state = follower.update(PitchFrame(audio_time=time))
+            self.assertEqual(state.note_index, int(time))
+            self.assertEqual(state.status, "tracking")
+            self.assertAlmostEqual(state.beat_position, time)
+        state = follower.update(PitchFrame(audio_time=5.0, midi_float=62.0, confidence=0.95, voiced=True))
+        self.assertEqual(state.note_index, 5)
+        self.assertEqual(state.error_cents, 0.0)
+        self.assertEqual(state.tempo_bpm, 60.0)
+
+    def test_trailing_rest_reaches_end_without_losing_track(self):
+        score = parse_jianpu_text("1=C 2/4 60\n| 1 0 |").score
+        follower = ScoreFollower(score, bpm_hint=60, start_index=0)
+        follower.update(PitchFrame(audio_time=0.2, midi_float=60.0, confidence=0.95, voiced=True))
+        follower.update(PitchFrame(audio_time=1.0))
+        state = follower.update(PitchFrame(audio_time=8.0))
+        self.assertEqual(state.status, "paused")
+        self.assertEqual(state.beat_position, 2.0)
+        self.assertEqual(state.reason, "已到乐谱末尾")
 
 
 if __name__ == "__main__":

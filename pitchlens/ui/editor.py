@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -252,6 +253,8 @@ class ScoreEditorDialog(QDialog):
         self.warning_label.setWordWrap(True)
         self.warning_label.setObjectName("Muted")
         root.addWidget(self.warning_label)
+        self.confirm_recognition = QCheckBox("已核对识谱提示，应用时清除这些提示")
+        root.addWidget(self.confirm_recognition)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Apply
@@ -297,9 +300,11 @@ class ScoreEditorDialog(QDialog):
         self._updating = False
 
     def _refresh_preview(self) -> None:
+        self.confirm_recognition.setVisible(self.score.source == "image" and bool(self.score.source_warnings))
         self.image_view.set_image_bytes(self.image_bytes)
         self.image_view.set_notes(self.score.notes)
         self.warning_label.setText(" · ".join(self.score.warnings[:4]))
+        self.warning_label.setToolTip("\n".join(self.score.warnings))
         if self.score.warnings:
             self.warning_pill.setText(f"{len(self.score.warnings)} 项待确认")
             self.warning_pill.setObjectName("PillWarn")
@@ -533,6 +538,7 @@ class ScoreEditorDialog(QDialog):
             self._updating = False
         self.image_view.set_notes(self.score.notes)
         self.warning_label.setText(" · ".join(self.score.warnings[:4]))
+        self.warning_label.setToolTip("\n".join(self.score.warnings))
         if self.score.warnings:
             self.warning_pill.setText(f"{len(self.score.warnings)} 项待确认")
             self.warning_pill.setObjectName("PillWarn")
@@ -665,6 +671,8 @@ class ScoreEditorDialog(QDialog):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self._apply_metadata()
+            if self.confirm_recognition.isChecked():
+                self.score.source_warnings.clear()
             self.score.refresh()
             self.result_score = self.score.copy()
             logging.info("editor.apply done %.0fms", (time.perf_counter() - t0) * 1000)

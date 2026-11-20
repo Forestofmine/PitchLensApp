@@ -40,6 +40,10 @@ a = Analysis(
     ],
     noarchive=False,
 )
+# Qt uses Windows' unversioned ICU exports. A third-party ICU with the same
+# DLL name on the build machine can shadow them and prevent Qt from loading.
+windows_icu = {"icu.dll", "icuin.dll", "icuuc.dll"}
+a.binaries = [entry for entry in a.binaries if Path(entry[0]).name.lower() not in windows_icu]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,

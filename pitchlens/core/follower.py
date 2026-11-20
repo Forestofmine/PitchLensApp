@@ -73,7 +73,7 @@ class ScoreFollower:
             self.bpm_hint = max(30.0, min(260.0, float(bpm_hint)))
         self.reset(self._preferred_start)
 
-    def reset(self, start_index: int | None = None) -> None:
+    def reset(self, start_index: int | None = None, *, now: float = 0.0) -> None:
         self._preferred_start = start_index
         self._auto_start = start_index is None
         self.index = int(start_index) if start_index is not None else -1
@@ -84,9 +84,9 @@ class ScoreFollower:
         self.beat_position = (
             float(self.score.notes[self.index].start_beat) if self.index >= 0 else 0.0
         )
-        self._note_enter_time = 0.0
-        self._last_frame_time = 0.0
-        self._last_voiced_time = 0.0
+        self._note_enter_time = now
+        self._last_frame_time = now
+        self._last_voiced_time = now
         self._last_target_time = 0.0
         self._error_ema: float | None = None
         self._confidence = 0.0
@@ -134,7 +134,12 @@ class ScoreFollower:
             self._last_voiced_time = current_time
 
         if self.status == "waiting":
-            return self._update_waiting(frame, current_time, midi, voiced)
+            if self.score.notes[0].midi_pitch is None:
+                self.index = 0
+                self._note_enter_time = current_time
+                self.status = "tracking"
+            else:
+                return self._update_waiting(frame, current_time, midi, voiced)
         if self.status == "lost":
             return self._update_lost(frame, current_time, midi, voiced)
         if self.status in {"tracking", "paused"}:
@@ -238,7 +243,17 @@ class ScoreFollower:
         dt: float,
     ) -> FollowState:
         note = self.score.notes[self.index]
+        if note.midi_pitch is None:
+            return self._update_rest(now, midi if voiced else None)
+
         expected = max(0.08, note.duration_beat * 60.0 / max(30.0, self.tempo_bpm))
+        elapsed = now - self._note_enter_time
+        next_index = self.index + 1
+        next_note = self.score.notes[next_index] if next_index < len(self.score.notes) else None
+        next_is_rest = next_note is not None and next_note.midi_pitch is None
+        if next_is_rest and self._match_streak and elapsed + 1e-9 >= expected:
+            self._enter_next_note(self._note_enter_time + expected)
+            return self._update_rest(now, midi if voiced else None)
 
         if not voiced:
             silence = now - self._last_voiced_time
@@ -258,13 +273,7 @@ class ScoreFollower:
         assert midi is not None
         self.status = "tracking"
         target_midi = note.midi_pitch
-        if target_midi is None:
-            # Rest: advance silently after its nominal duration.
-            elapsed = now - self._note_enter_time
-            if elapsed >= expected * 0.95:
-                return self._advance(now, midi, elapsed, note)
-            return self._state("tracking", self.index, "休止", midi)
-
+        assert target_midi is not None
         distance = midi - target_midi
         cents = distance * 100.0
         self._error_ema = (
@@ -286,17 +295,10 @@ class ScoreFollower:
             self._wrong_streak += 1
             self._match_streak = 0
 
-        elapsed = now - self._note_enter_time
         in_tune = abs(cents) <= self.good_cents
-        next_note = self._next_sung_note(self.index + 1)
-        if next_note is not None:
-            next_index, next_note_obj = next_note
-            next_distance = abs(midi - (next_note_obj.midi_pitch or midi))
-            same_pitch = (
-                target_midi is not None
-                and next_note_obj.midi_pitch is not None
-                and abs(next_note_obj.midi_pitch - target_midi) < 0.01
-            )
+        if next_note is not None and next_note.midi_pitch is not None:
+            next_distance = abs(midi - next_note.midi_pitch)
+            same_pitch = next_note.midi_pitch == target_midi
             onset = frame.onset_strength >= 0.50
             if same_pitch:
                 # Repeated identical notes are inherently ambiguous from pitch
@@ -319,7 +321,7 @@ class ScoreFollower:
         # A narrow skip-ahead rule: only when the pitch is clearly *not* the
         # current note and matches a note two positions ahead.  This avoids the
         # classic "same pitch appears later" false jump.
-        if abs(distance) >= 0.9 and elapsed >= expected * 0.55:
+        if not next_is_rest and abs(distance) >= 0.9 and elapsed >= expected * 0.55:
             jump = self._best_nearby_match(midi, self.index + 2, 2)
             if jump is not None and jump[1] <= 0.45:
                 self._advance_pending += 1
@@ -352,31 +354,37 @@ class ScoreFollower:
             self.tempo_bpm = max(
                 35.0, min(240.0, 0.82 * self.tempo_bpm + 0.18 * observed)
             )
-        next_index = self._next_sung_index(self.index + 1)
-        if next_index is None:
-            self.status = "paused"
-            self._last_reason = "已到乐谱末尾"
-            return self._state("paused", self.index, self._last_reason, midi)
-        self.index = next_index
-        self._note_enter_time = now
-        self.beat_position = float(self.score.notes[next_index].start_beat)
+        self._enter_next_note(now)
+        return self._make_state(self.score.notes[self.index], midi)
+
+    def _enter_next_note(self, when: float) -> None:
+        self.index += 1
+        self.status = "tracking"
+        self._note_enter_time = when
+        self.beat_position = float(self.score.notes[self.index].start_beat)
         self._match_streak = 0
         self._wrong_streak = 0
         self._advance_pending = 0
-        self._last_reason = f"进入第 {next_index + 1} 个音符"
-        return self._make_state(self.score.notes[next_index], midi)
+        self._last_reason = f"进入第 {self.index + 1} 个音符"
 
-    def _next_sung_index(self, start: int) -> int | None:
-        for index in range(max(0, start), len(self.score.notes)):
-            if self.score.notes[index].midi_pitch is not None:
-                return index
-        return None
-
-    def _next_sung_note(self, start: int) -> tuple[int, NoteEvent] | None:
-        index = self._next_sung_index(start)
-        if index is None:
-            return None
-        return index, self.score.notes[index]
+    def _update_rest(self, now: float, midi: float | None) -> FollowState:
+        seconds_per_beat = 60.0 / self.tempo_bpm
+        while (note := self.score.notes[self.index]).midi_pitch is None:
+            end_time = self._note_enter_time + note.duration_beat * seconds_per_beat
+            if now + 1e-9 < end_time:
+                self.status = "tracking"
+                elapsed = max(0.0, now - self._note_enter_time)
+                self.beat_position = note.start_beat + elapsed / seconds_per_beat
+                self._last_reason = "休止"
+                return self._make_state(note, None)
+            if self.index + 1 == len(self.score.notes):
+                self.status = "paused"
+                self.beat_position = note.end_beat
+                self._last_reason = "已到乐谱末尾"
+                return self._make_state(note, None)
+            self._last_voiced_time = max(self._last_voiced_time, end_time)
+            self._enter_next_note(end_time)
+        return self._make_state(note, midi)
 
     def _best_nearby_match(
         self, midi: float, start: int, count: int
@@ -385,7 +393,7 @@ class ScoreFollower:
         for index in range(max(0, start), min(len(self.score.notes), start + count)):
             note = self.score.notes[index]
             if note.midi_pitch is None:
-                continue
+                break
             distance = abs(midi - note.midi_pitch)
             if best is None or distance < best[1]:
                 best = (index, distance)

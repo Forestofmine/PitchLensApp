@@ -34,7 +34,7 @@ class JianpuTextDialog(QDialog):
         help_text = QLabel(
             "第一行写调号/拍号/速度，例如 <b>1=C 4/4 90</b>，下一行用 <b>|</b> 分小节。<br>"
             "<b>1'</b> 高八度 · <b>1,</b> 低八度 · <b>1_</b> 八分音符 · <b>1__</b> 十六分 · "
-            "<b>1.</b> 附点 · <b>-</b> 延长一拍 · <b>0</b> 休止 · <b>#4/b7</b> 升降音"
+            "<b>1.</b> 附点 · <b>-</b> 在本小节延长一拍 · <b>0</b> 休止 · <b>#4/b7</b> 升降音"
         )
         help_text.setObjectName("Muted")
         help_text.setWordWrap(True)

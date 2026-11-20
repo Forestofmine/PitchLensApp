@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -45,14 +46,13 @@ from .theme import COLORS, apply_theme, theme_name
 
 
 class RecognitionThread(QThread):
-    completed = Signal(object)
-    failed = Signal(str)
-
     def __init__(self, data: bytes, title: str, base_octave: int, parent=None) -> None:
         super().__init__(parent)
         self.data = data
         self.title = title
         self.base_octave = int(base_octave)
+        self.result: RecognitionResult | None = None
+        self.error: str | None = None
 
     def run(self) -> None:
         t0 = time.perf_counter()
@@ -66,13 +66,13 @@ class RecognitionThread(QThread):
                 (time.perf_counter() - t0) * 1000,
                 len(result.score.notes),
             )
-            self.completed.emit(result)
+            self.result = result
         except Exception as exc:  # pragma: no cover - UI path
             import traceback
 
             traceback.print_exc()
             logging.exception("recognition failed after %.0fms", (time.perf_counter() - t0) * 1000)
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.error = f"{type(exc).__name__}: {exc}"
 
 
 class MainWindow(QMainWindow):
@@ -91,9 +91,12 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._tick)
         self._running = False
         self._now = 0.0
+        self._history_time_offset = 0.0
         self._last_state = FollowState()
         self._last_frame: PitchFrame | None = None
         self._recognition_thread: RecognitionThread | None = None
+        self._recognition_obsolete = False
+        self._closing = False
         self._frame_count = 0
         self._fps = 0.0
         self._fps_t0 = time.perf_counter()
@@ -328,6 +331,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- project
     def _apply_project(self, project: Project, *, reset: bool = True) -> None:
         t0 = time.perf_counter()
+        if self._recognition_thread is not None:
+            self._recognition_obsolete = True
         if self._practice_mode:
             # Loading a score always leaves practice mode first.
             self._exit_practice()
@@ -340,15 +345,19 @@ class MainWindow(QMainWindow):
         score = project.score
         self.follower.set_score(score, bpm_hint=score.tempo_hint)
         if reset:
-            self.follower.reset(0)
+            audio_now = self.audio.audio_time() if self.audio else 0.0
+            self.follower.reset(0, now=audio_now)
             self._resume_index = 0
         self.score_panel.set_project(score, project.image_bytes)
         self.score_panel.view.auto_follow = self.settings.auto_follow_scroll
         if score.notes:
             self.score_panel.set_current_note(score.notes[0].id)
         self.timeline.clear()
+        if not self._running:
+            self._now = 0.0
+            self._history_time_offset = 0.0
         self._last_state = self.follower.state
-        self.timeline.update_view(0.0, self._last_state, follower=self.follower)
+        self.timeline.update_view(self._now, self._last_state, follower=self.follower)
         self._update_actions()
         self.setWindowTitle(f"{score.title} · PitchLens 音准镜")
         if score.notes:
@@ -362,10 +371,13 @@ class MainWindow(QMainWindow):
 
     def _update_actions(self) -> None:
         has_project = self.project is not None
-        has_score = bool(self.project and self.project.score.notes)
         practice = self._practice_mode
-        self.edit_btn.setEnabled(has_project and not practice)
-        self.correct_btn.setEnabled(has_project and not practice)
+        can_edit = has_project and not practice and self._recognition_thread is None
+        self.edit_btn.setEnabled(can_edit)
+        self.correct_btn.setEnabled(can_edit)
+        warnings = self.project.score.warnings if self.project else []
+        self.correct_btn.setText(f"校正 / 编辑 · {len(warnings)} 项待确认" if warnings else "校正 / 编辑")
+        self.correct_btn.setToolTip("\n".join(warnings[:5]))
         self.save_btn.setEnabled(has_project)
         self.boxes_btn.setEnabled(
             has_project and self.project.has_image and not practice
@@ -421,7 +433,8 @@ class MainWindow(QMainWindow):
         if self.project is not None:
             score = self.project.score
             self.follower.set_score(score, bpm_hint=score.tempo_hint)
-            self.follower.reset(0)
+            audio_now = self.audio.audio_time() if self.audio else 0.0
+            self.follower.reset(0, now=audio_now)
             self._resume_index = 0
             self.score_panel.set_project(score, self.project.image_bytes)
             self.score_panel.view.auto_follow = self.settings.auto_follow_scroll
@@ -462,21 +475,16 @@ class MainWindow(QMainWindow):
         self._start_recognition(data, title=title or Path(path).stem)
 
     def _start_recognition(self, data: bytes, title: str) -> None:
-        if self._recognition_thread is not None and self._recognition_thread.isRunning():
+        if self._closing or self._recognition_thread is not None:
             return
-        self.import_btn.setEnabled(False)
-        # Recognition finishing pops a modal message box; if the user had the
-        # editor open at that moment the two modal grabs fight and the UI
-        # looks frozen.  Keep the editor out of reach while recognition runs.
-        self.edit_btn.setEnabled(False)
-        self.correct_btn.setEnabled(False)
-        self.settings_btn.setEnabled(False)
-        self._set_status(f"正在识别《{title}》… 音频与界面保持可用")
         thread = RecognitionThread(data, title, self.settings.base_octave, self)
-        thread.completed.connect(self._on_recognition_done)
-        thread.failed.connect(self._on_recognition_failed)
-        thread.finished.connect(self._on_recognition_finished)
         self._recognition_thread = thread
+        self._recognition_obsolete = False
+        thread.finished.connect(self._on_recognition_finished)
+        self.import_btn.setEnabled(False)
+        self.settings_btn.setEnabled(False)
+        self._update_actions()
+        self._set_status(f"正在识别《{title}》… 音频与界面保持可用")
         thread.start()
 
     def _on_recognition_done(self, result: RecognitionResult) -> None:
@@ -511,15 +519,15 @@ class MainWindow(QMainWindow):
                 f"{'有提示，可打开校正' if score.warnings else '时值校验通过'}"
             )
             return
-        if score.warnings:
-            QMessageBox.information(self, "识别完成（需校正）", summary)
-        elif not score.notes:
+        if not score.notes:
             QMessageBox.warning(
                 self,
                 "未识别到音符",
                 "图片可能不是清晰的单声部印刷简谱。\n"
                 "请使用“识谱校正”手动添加，或用“手动录入”粘贴简谱文本。",
             )
+        elif score.warnings:
+            QMessageBox.information(self, "识别完成（需校正）", summary)
         else:
             self._set_status(f"识别完成 · {len(score.notes)} 个音符 · 时值校验通过")
             QMessageBox.information(self, "识别完成", summary + "\n\n可直接点击“开始演唱”。")
@@ -534,10 +542,23 @@ class MainWindow(QMainWindow):
         )
 
     def _on_recognition_finished(self) -> None:
+        thread = self._recognition_thread
+        if thread is None:
+            return
+        self._recognition_thread = None
+        thread.deleteLater()
+        if self._closing:
+            self.close()
+            return
         self.import_btn.setEnabled(True)
         self.settings_btn.setEnabled(True)
         self._update_actions()
-        self._recognition_thread = None
+        if self._recognition_obsolete:
+            self._quiet_start = False
+        elif thread.error is not None:
+            self._on_recognition_failed(thread.error)
+        elif thread.result is not None:
+            self._on_recognition_done(thread.result)
 
     # ---------------------------------------------------------------- demo
     def _load_demo(self) -> None:
@@ -637,12 +658,12 @@ class MainWindow(QMainWindow):
         index = self.project.score.index_of(note_id)
         if index < 0:
             return
-        now = self.audio.display_time() if self.audio else self._now
-        state = self.follower.seek(index, now)
+        audio_now = self.audio.audio_time() if self.audio else None
+        state = self.follower.seek(index, audio_now)
         self._last_state = state
         self._resume_index = index
         self.score_panel.set_current_note(self.project.score.notes[index].id)
-        self.timeline.update_view(now, state, follower=self.follower)
+        self.timeline.update_view(self._now, state, follower=self.follower)
         self._set_status(f"已定位到第 {index + 1} 个音符")
 
     # --------------------------------------------------------------- audio
@@ -693,9 +714,8 @@ class MainWindow(QMainWindow):
         else:
             self.follower.set_score(Score(), bpm_hint=self.settings.default_bpm)
             self._resume_index = None
-        self.timeline.clear()
         self.timeline.set_paused(False)
-        self._now = 0.0
+        self._last_frame = None
         self._last_state = self.follower.state
         self.start_btn.setText("暂停")
         self.start_btn.setObjectName("TransportStop")
@@ -707,7 +727,9 @@ class MainWindow(QMainWindow):
     def _stop_audio(self) -> None:
         if self.audio is not None:
             self.audio.stop()
+            self._history_time_offset += self.audio.audio_time()
             self.audio = None
+            self.timeline.end_segment()
         self._running = False
         self._timer.stop()
         self.start_btn.setText("开始演唱")
@@ -726,6 +748,7 @@ class MainWindow(QMainWindow):
         self._resume_index = 0
         self.timeline.clear()
         self.timeline.set_paused(False)
+        self._history_time_offset = 0.0
         self._now = 0.0
         self._last_state = self.follower.state
         self.timeline.update_view(0.0, self._last_state, follower=self.follower)
@@ -745,14 +768,15 @@ class MainWindow(QMainWindow):
         self._fps_frames += 1
         if frames:
             self._frame_count += len(frames)
-            self.timeline.append_frames(frames)
+            self.timeline.append_frames([
+                replace(frame, audio_time=frame.audio_time + self._history_time_offset)
+                for frame in frames
+            ])
             for frame in frames:
                 state = self.follower.update(frame, frame.audio_time)
                 self._last_state = state
                 self._last_frame = frame
-            self._now = self.audio.display_time()
-        else:
-            self._now = self.audio.display_time()
+        self._now = self._history_time_offset + self.audio.display_time()
 
         state = self._last_state
         self.timeline.update_view(
@@ -843,10 +867,15 @@ class MainWindow(QMainWindow):
                 return
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self._stop_audio()
-        if self._recognition_thread is not None and self._recognition_thread.isRunning():
-            self._recognition_thread.quit()
-            self._recognition_thread.wait(800)
+        if not self._closing:
+            self._closing = True
+            self.setAcceptDrops(False)
+            self._stop_audio()
+        if self._recognition_thread is not None:
+            self.centralWidget().setEnabled(False)
+            self._set_status("正在结束识谱，完成后关闭…")
+            event.ignore()
+            return
         self._save_settings()
         event.accept()
 

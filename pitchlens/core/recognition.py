@@ -21,7 +21,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import cv2
 import numpy as np
@@ -344,11 +344,10 @@ class JianpuRecognizer:
             image_name=title,
             meta_confidence=float(meta.get("confidence", 0.0)),
         )
-        score.refresh()
-        # Keep recognition warnings ahead of validation warnings.
-        score.warnings = dedupe(warnings + score.warnings)
         if not notes:
-            score.warnings.insert(0, "没有识别到音符，请使用“手动录入”或在校正中添加")
+            warnings.insert(0, "没有识别到音符，请使用“手动录入”或在校正中添加")
+        score.source_warnings = list(dict.fromkeys(warnings))
+        score.refresh()
         debug = {
             "scale": scale,
             "deskew_deg": angle,
@@ -1221,13 +1220,3 @@ def _union_symbols(a: Symbol, b: Symbol) -> Symbol:
     right = max(a.right, b.right)
     bottom = max(a.bottom, b.bottom)
     return Symbol("piece", x, y, right - x, bottom - y)
-
-
-def dedupe(items: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in items:
-        if item and item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result

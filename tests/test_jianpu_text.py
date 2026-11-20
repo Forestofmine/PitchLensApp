@@ -78,6 +78,22 @@ class JianpuTextTests(unittest.TestCase):
         again = parse_jianpu_text(export_jianpu_text(score)).score
         self.assertAlmostEqual(again.notes[0].duration_beat, 3.0)
 
+    def test_dash_at_measure_boundary_does_not_modify_previous_note(self):
+        for bar in ("|", "||", "|."):
+            with self.subTest(bar=bar):
+                parsed = parse_jianpu_text(f"1=C 4/4 90\n| 1 2 3 4 {bar} - 5 6 7 |")
+                score = parsed.score
+                self.assertEqual(score.measure_totals(), {0: 4.0, 1: 4.0})
+                self.assertEqual(score.notes[3].duration_beat, 1.0)
+                self.assertTrue(score.notes[4].is_rest)
+                self.assertEqual(score.notes[4].measure_index, 1)
+                self.assertEqual(len(score.warnings), 1)
+                self.assertIn("不支持跨小节", score.warnings[0])
+                self.assertEqual(score.refresh(), parsed.warnings)
+                again = parse_jianpu_text(export_jianpu_text(score)).score
+                self.assertEqual(again.measure_totals(), score.measure_totals())
+                self.assertTrue(again.notes[4].is_rest)
+
 
 if __name__ == "__main__":
     unittest.main()
