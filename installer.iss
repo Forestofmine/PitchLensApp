@@ -3,7 +3,7 @@
 ; Inno Setup 6 (ISCC.exe installer.iss).
 
 #define MyAppName "PitchLens 音准镜"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "PitchLens"
 #define MyAppExeName "PitchLens.exe"
 

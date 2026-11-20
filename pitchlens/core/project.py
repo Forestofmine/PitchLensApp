@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .. import __version__
 from .score import Score
 
 
@@ -24,7 +25,7 @@ class Project:
     source_name: str = ""
     settings: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
-    app_version: str = "1.0.0"
+    app_version: str = __version__
 
     @property
     def has_image(self) -> bool:
